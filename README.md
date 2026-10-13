@@ -61,8 +61,8 @@ bash tests/run_gather_pa_kv_cache_multiprocess.sh \
 - `batch_size` 是**每 die** 的请求数；`copy_count` 是**每个请求**固定 gather 的 token 数（即 `seq_lens` 的固定值）。每 die 每轮有效 payload = `batch_size × copy_count × bytes_per_token`。
 - 默认卡数为可见数量内的 `1 2 4 8 16`；显式指定时支持任意正数卡数，不局限于这些档位。
 - 默认 `BATCH_SIZES="8 16 24 32"`、`COPY_COUNTS="0 100 200 300 500 2048"`、`SOURCE_LEN=65536`、`WARMUP=10`、`ITERS=1000`、`SEED=7`。
-- 其余参数：`--source-len`、`--num-heads`、`--head-size-k`、`--head-size-v`、`--source-memory {dram,hbm}`、`--warmup`、`--iters`、`--seed`、`--results-dir`；同名大写下划线环境变量（`SOURCE_LEN`/`WARMUP`/`ITERS`/`SEED`/`SOURCE_MEMORY`/`RESULTS_DIR`）也可使用。Python 路径可用 `PYTHON_BIN` 指定。
-- `block_tables` 每行为 `randperm(source_blocks)`（`source_blocks = ceil(source_len/128)`），int32；输出为紧凑 `[total_tokens, ...]`，因此没有 hbm_slots / copy_cap 参数。
+- 其余参数：`--source-len`、`--num-heads`、`--head-size-k`、`--head-size-v`、`--block-size`、`--source-memory {dram,hbm}`、`--warmup`、`--iters`、`--seed`、`--results-dir`；同名大写下划线环境变量（`SOURCE_LEN`/`BLOCK_SIZE`/`WARMUP`/`ITERS`/`SEED`/`SOURCE_MEMORY`/`RESULTS_DIR`）也可使用。Python 路径可用 `PYTHON_BIN` 指定。
+- `block_tables` 每行为 `randperm(source_blocks)`（`source_blocks = ceil(source_len/block_size)`），int32；输出为紧凑 `[total_tokens, ...]`，因此没有 hbm_slots / copy_cap 参数。
 - 空列表、重复值、负数、超出可见数量的卡数、不满足 `0 <= copy_count <= source_len` 的 copy 数，在启动 worker 前报错。
 
 ## 单组与单 die 入口
@@ -82,6 +82,32 @@ python3 tests/test_gather_pa_kv_cache.py \
 ```
 
 `--copy-count` 同时设置 `--copy-min/--copy-max`。随机范围参数仍可用于正确性测试；分析这种结果时 `copy_count` 显示为 `min..max`，不会把上限冒充固定 copy 数。
+
+## 访问模式：block 粒度（默认）与 token 粒度（--block-size 1）
+
+算子语义是"每请求 gather 逻辑区间 `0..seq_len-1`"，物理位置 = `block_tables[t // block_size] * block_size + t % block_size`。因此访问模式由 `--block-size` 决定：
+
+- **`--block-size 128`（默认，paged attention 布局）**：copy=N 是每请求一段"N 个 token 的前缀"，块内连续（128 token ≈ 82KB）、块间随机跳——对应 chunked prefill / 整段前缀加载场景。
+- **`--block-size 1`（token 粒度）**：每个 block 表项直接是一个 token 的物理位置，copy=N 就是 N 个**随机散落 token** 的 656B 行 gather——对应 DSA offload 稀疏 miss 场景，与 scatter_copy C8 的访问模式同口径。注意：这只是用算子表达出了该负载；CANN 原始 kernel 按 block 组织拷贝且每次拷贝同步等待，block=1 时效率预期显著低于 block=128，这正是要测的。
+
+非默认 block_size 的 case 文件名带 `_blk<N>` 后缀（如 `cards1_bs8_copy100_blk1.json`）；不同 block_size 的结果混在同一目录分析时会因 cards/BS/copy 重复而报错，请用 `RESULTS_DIR` 分开存放。
+
+单卡 D2D token 粒度示例（一张卡、每请求 300 个随机 token、HBM 源）：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+python3 tests/test_gather_pa_kv_cache.py \
+  --device npu:0 --source-memory hbm --block-size 1 \
+  --batch-size 24 --copy-count 300 --warmup 10 --iters 1000
+```
+
+整机扫参同理，加环境变量即可，例如 D2D + token 粒度：
+
+```bash
+SOURCE_MEMORY=hbm BLOCK_SIZE=1 RESULTS_DIR=results/gather_pa_kv_cache_d2d_blk1 \
+A5_TEST_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CARD_COUNTS="1 2 4 8" BATCH_SIZES="8 16 24 32" \
+  bash tests/run_gather_pa_kv_cache_multiprocess.sh
+```
 
 每组校验内容：CPU 参考 gather（经 `block_tables` 逐 token 映射到源物理行）与设备输出**按位比较**；每次校验前对输出写 poison；first-fill 容量校验（单请求 `seq_len=source_len`）；`copy_count=0` 时 `seq_lens` 全零、输出为空张量，调用必须是 no-op；输入只读校验（`block_tables`/`seq_lens`/`seq_offset` 调用前后逐字节不变；`--source-memory hbm` 时源 cache 也直接回读校验，DRAM/swapped-memory 源不做 D2H 回读，其字节完好性由输出的按位比较间接证明）；caller-owned 校验（调用前后 `data_ptr` 不变；该 torch_npu 封装可能无返回值，只打印实际返回类型，不断言）。
 

@@ -80,7 +80,7 @@ def normalize_case(case: dict) -> dict:
             raise ValueError("Incorrect payload bytes per token.")
         if worker_config.get("dtype_k", DTYPE_K) != DTYPE_K or worker_config.get("dtype_v", DTYPE_V) != DTYPE_V:
             raise ValueError(f"This suite reports only {DTYPE_K}/{DTYPE_V} results.")
-        for key in ("batch_size", "copy_min", "copy_max", "source_len",
+        for key in ("batch_size", "copy_min", "copy_max", "source_len", "block_size",
                     "num_heads", "head_size_k", "head_size_v", "warmup", "iters"):
             if key in config and worker_config.get(key) != config[key]:
                 raise ValueError(f"Workers have inconsistent {key} values.")

@@ -219,12 +219,24 @@ class SweepTests(unittest.TestCase):
             args = launcher.parse_args()
         self.assertEqual(args.output.name, "cards2_bs17_copy321.json")
         self.assertEqual((args.num_heads, args.head_size_k, args.head_size_v), (1, 512, 72))
+        self.assertEqual(args.block_size, 128)
         worker = importlib.import_module("test_gather_pa_kv_cache")
         with patch.object(sys, "argv", ["test", "--copy-count", "200"]):
             args = worker.parse_args()
         self.assertEqual((args.copy_min, args.copy_max), (200, 200))
         self.assertEqual((args.batch_size, args.source_len, args.warmup, args.iters), (24, 65536, 10, 1000))
         self.assertEqual(args.source_memory, "dram")
+
+    def test_block_size_token_granular_mode(self):
+        with patch.dict(os.environ, {"TEST_VISIBLE_DEVICES": "0", "CARD_COUNTS": "1",
+                                    "BATCH_SIZES": "8", "COPY_COUNTS": "100"}, clear=True):
+            args = parse_args(["--dry-run", "--block-size", "1"])
+            name, _, command = list(cases(args))[0]
+        self.assertEqual(name, "cards1_bs8_copy100_blk1")
+        self.assertEqual(command[command.index("--block-size") + 1], "1")
+        with patch.dict(os.environ, {"TEST_VISIBLE_DEVICES": "0", "BLOCK_SIZE": "0"}, clear=True):
+            with self.assertRaises(ValueError):
+                parse_args([])
 
 
 if __name__ == "__main__":

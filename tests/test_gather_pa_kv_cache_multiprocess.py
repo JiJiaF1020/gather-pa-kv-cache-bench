@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gather_cli import add_device_args, resolve_copy_count, selected_devices, validate_workload
-from gather_config import BLOCK_SIZE, DTYPE_K, DTYPE_V, MULTIPROCESS_TEST, SINGLECARD_TEST
+from gather_config import DTYPE_K, DTYPE_V, MULTIPROCESS_TEST, SINGLECARD_TEST
 from gather_results import copy_label, print_result, summarize_devices
 
 from _common import add_case_args, case_bytes_per_token, validate_args, write_json
@@ -95,6 +95,7 @@ def run_workers(args: argparse.Namespace, devices: list[int]) -> list[dict]:
                 command = [
                     sys.executable, str(worker), "--device", f"npu:{device}",
                     "--batch-size", str(args.batch_size), "--source-len", str(args.source_len),
+                    "--block-size", str(args.block_size),
                     "--num-heads", str(args.num_heads), "--head-size-k", str(args.head_size_k),
                     "--head-size-v", str(args.head_size_v),
                     "--copy-min", str(args.copy_min), "--copy-max", str(args.copy_max),
@@ -154,7 +155,7 @@ def summarize(args: argparse.Namespace, devices: list[int], per_device: list[dic
         "config": {
             "dtype_k": DTYPE_K, "dtype_v": DTYPE_V,
             "num_heads": args.num_heads, "head_size_k": args.head_size_k, "head_size_v": args.head_size_v,
-            "block_size": BLOCK_SIZE, "bytes_per_token": case_bytes_per_token(args),
+            "block_size": args.block_size, "bytes_per_token": case_bytes_per_token(args),
             "batch_size": args.batch_size, "source_len": args.source_len,
             "copy_min": args.copy_min, "copy_max": args.copy_max,
             "warmup": args.warmup, "iters": args.iters, "seed": args.seed,

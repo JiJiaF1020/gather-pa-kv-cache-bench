@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gather_cli import resolve_copy_count
-from gather_config import BLOCK_SIZE, DTYPE_K, DTYPE_V, SINGLECARD_TEST
+from gather_config import DTYPE_K, DTYPE_V, SINGLECARD_TEST
 from gather_results import print_result, single_result
 
 from _common import add_case_args, case_bytes_per_token, validate_args, write_json
@@ -24,6 +24,7 @@ class Case:
     device: torch.device
     device_name: str
     source_blocks: int
+    block_size: int
     bytes_per_token: int
     source_memory: str
     key_cache_cpu: torch.Tensor
@@ -62,7 +63,7 @@ def make_case(args: argparse.Namespace) -> Case:
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
     generator = torch.Generator().manual_seed(args.seed)
-    source_blocks = (args.source_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    source_blocks = (args.source_len + args.block_size - 1) // args.block_size
     payload_size = case_bytes_per_token(args)
     # Same source-pool policy as the scatter_copy suite: read-only physical
     # blocks are shared by requests, each with its own randomized block table.
@@ -78,16 +79,16 @@ def make_case(args: argparse.Namespace) -> Case:
     total_tokens = int(seq_lens_cpu.sum())
     # fp8/bf16 payloads are initialized through integer storage so that the
     # source contents and the correctness comparison stay bit-exact.
-    key_cache_cpu = torch.randint(-128, 128, (source_blocks, BLOCK_SIZE, args.num_heads, args.head_size_k),
+    key_cache_cpu = torch.randint(-128, 128, (source_blocks, args.block_size, args.num_heads, args.head_size_k),
                                   dtype=torch.int8, generator=generator)
-    value_cache_cpu = torch.randint(-32768, 32768, (source_blocks, BLOCK_SIZE, args.num_heads, args.head_size_v),
+    value_cache_cpu = torch.randint(-32768, 32768, (source_blocks, args.block_size, args.num_heads, args.head_size_v),
                                     dtype=torch.int16, generator=generator)
 
     key_cache = allocate_source(key_cache_cpu, device, args.source_memory).view(torch.float8_e4m3fn)
     value_cache = allocate_source(value_cache_cpu, device, args.source_memory).view(torch.bfloat16)
     return Case(
-        device=device, device_name=device_name, source_blocks=source_blocks, bytes_per_token=payload_size,
-        source_memory=args.source_memory,
+        device=device, device_name=device_name, source_blocks=source_blocks, block_size=args.block_size,
+        bytes_per_token=payload_size, source_memory=args.source_memory,
         key_cache_cpu=key_cache_cpu, value_cache_cpu=value_cache_cpu,
         block_tables_cpu=block_tables_cpu, seq_lens_cpu=seq_lens_cpu, seq_offset_cpu=seq_offset_cpu,
         key_cache=key_cache, value_cache=value_cache,
@@ -108,7 +109,7 @@ def reference_gather(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
             continue
         tokens = torch.arange(length)
         blocks = case.block_tables_cpu[row].long()
-        physical = blocks[tokens // BLOCK_SIZE] * BLOCK_SIZE + tokens % BLOCK_SIZE
+        physical = blocks[tokens // case.block_size] * case.block_size + tokens % case.block_size
         keys.append(key_rows[physical])
         values.append(value_rows[physical])
     key_shape = (0, case.key_cache_cpu.shape[2], case.key_cache_cpu.shape[3])
@@ -214,7 +215,7 @@ def run(args: argparse.Namespace) -> dict:
         f"A5_GATHER_PA_CONFIG device={case.device} device_name={case.device_name!r} "
         f"dtype_k={DTYPE_K} dtype_v={DTYPE_V} num_heads={args.num_heads} "
         f"head_size_k={args.head_size_k} head_size_v={args.head_size_v} "
-        f"block_size={BLOCK_SIZE} bytes_per_token={case.bytes_per_token} "
+        f"block_size={args.block_size} bytes_per_token={case.bytes_per_token} "
         f"batch={args.batch_size} source_len={args.source_len} source_blocks={case.source_blocks} "
         f"copy_range=[{args.copy_min},{args.copy_max}] seq_lens={case.seq_lens_cpu.tolist()} "
         f"source_memory={args.source_memory} allocator={allocator} "
@@ -254,7 +255,7 @@ def run(args: argparse.Namespace) -> dict:
             "device": str(case.device), "device_name": case.device_name,
             "dtype_k": DTYPE_K, "dtype_v": DTYPE_V,
             "num_heads": args.num_heads, "head_size_k": args.head_size_k, "head_size_v": args.head_size_v,
-            "block_size": BLOCK_SIZE, "bytes_per_token": case.bytes_per_token,
+            "block_size": args.block_size, "bytes_per_token": case.bytes_per_token,
             "batch_size": args.batch_size, "source_len": args.source_len, "source_blocks": case.source_blocks,
             "copy_min": args.copy_min, "copy_max": args.copy_max,
             "warmup": args.warmup, "iters": args.iters, "seed": args.seed,

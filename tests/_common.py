@@ -22,6 +22,9 @@ MAX_SOURCE_LEN = 1 << 18
 def add_case_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--source-len", type=int, default=65536)
+    parser.add_argument("--block-size", type=int, default=BLOCK_SIZE,
+                        help="Cache block size in tokens; 128 matches paged-attention layout, "
+                             "1 gives token-granular random gather (DSA sparse-miss pattern).")
     parser.add_argument("--num-heads", type=int, default=NUM_HEADS)
     parser.add_argument("--head-size-k", type=int, default=HEAD_SIZE_K)
     parser.add_argument("--head-size-v", type=int, default=HEAD_SIZE_V)
@@ -42,6 +45,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be positive.")
     if not 1 <= args.source_len <= MAX_SOURCE_LEN:
         raise ValueError("--source-len must be in [1,262144].")
+    if args.block_size < 1:
+        raise ValueError("--block-size must be positive.")
     if args.num_heads < 1 or args.head_size_k < 1 or args.head_size_v < 1:
         raise ValueError("--num-heads, --head-size-k and --head-size-v must be positive.")
     if not 0 <= args.copy_min <= args.copy_max <= args.source_len:

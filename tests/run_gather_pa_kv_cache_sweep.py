@@ -15,6 +15,7 @@ from pathlib import Path
 from analyze_gather_pa_kv_cache_results import analyze
 from gather_cli import parse_ids, validate_workload
 from gather_config import (
+    BLOCK_SIZE,
     DEFAULT_VISIBLE_DEVICES,
     DTYPE_K,
     DTYPE_V,
@@ -52,6 +53,8 @@ def parse_args(argv=None):
     parser.add_argument("--num-heads", type=int, default=NUM_HEADS)
     parser.add_argument("--head-size-k", type=int, default=HEAD_SIZE_K)
     parser.add_argument("--head-size-v", type=int, default=HEAD_SIZE_V)
+    parser.add_argument("--block-size", type=int, default=int(os.getenv("BLOCK_SIZE", str(BLOCK_SIZE))),
+                        help="Cache block size in tokens; 1 gives token-granular random gather.")
     parser.add_argument("--source-memory", choices=("dram", "hbm"), default=os.getenv("SOURCE_MEMORY", "dram"))
     parser.add_argument("--results-dir", type=Path, default=Path(os.getenv("RESULTS_DIR", str(ROOT / RESULTS_SUBDIR))))
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("DRY_RUN") == "1",
@@ -68,6 +71,8 @@ def parse_args(argv=None):
         setattr(args, key, integer_list(value, env, minimum))
     if max(args.cards) > len(visible):
         raise ValueError(f"Requested {max(args.cards)} dies, but only {len(visible)} devices are visible.")
+    if args.block_size < 1:
+        raise ValueError("--block-size must be positive.")
     for batch in args.batch_size:
         for count in args.copy_count:
             validate_workload(argparse.Namespace(**{**vars(args), "batch_size": batch,
@@ -81,10 +86,12 @@ def cases(args):
         for batch in args.batch_size:
             for copies in args.copy_count:
                 name = f"cards{cards}_bs{batch}_copy{copies}"
+                if args.block_size != BLOCK_SIZE:
+                    name += f"_blk{args.block_size}"
                 output = args.results_dir / f"{name}.json"
                 command = [sys.executable, str(ROOT / "tests/test_gather_pa_kv_cache_multiprocess.py"),
                            "--cards", str(cards), "--batch-size", str(batch), "--copy-count", str(copies),
-                           "--source-len", str(args.source_len),
+                           "--source-len", str(args.source_len), "--block-size", str(args.block_size),
                            "--num-heads", str(args.num_heads), "--head-size-k", str(args.head_size_k),
                            "--head-size-v", str(args.head_size_v),
                            "--source-memory", args.source_memory,
@@ -104,7 +111,7 @@ def run(args) -> None:
     payload_size = bytes_per_token(args.num_heads, args.head_size_k, args.head_size_v)
     if args.dry_run:
         print(f"ASCEND_RT_VISIBLE_DEVICES={args.visible_devices} dtype_k={DTYPE_K} dtype_v={DTYPE_V} "
-              f"bytes_per_token={payload_size} cases={len(planned)}")
+              f"block_size={args.block_size} bytes_per_token={payload_size} cases={len(planned)}")
         for _, _, command in planned:
             print(shlex.join(command))
         return
@@ -112,6 +119,7 @@ def run(args) -> None:
     manifest_path = args.results_dir / "gather_pa_kv_cache_run_manifest.json"
     manifest = {"schema_version": 2, "status": "running",
                 "dtype_k": DTYPE_K, "dtype_v": DTYPE_V, "bytes_per_token": payload_size,
+                "block_size": args.block_size,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "visible_devices": args.visible_devices,
                 "case_files": [output.name for _, output, _ in planned]}
