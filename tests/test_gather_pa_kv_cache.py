@@ -77,15 +77,16 @@ def make_case(args: argparse.Namespace) -> Case:
         seq_lens_cpu[1] = args.copy_max
     seq_offset_cpu = torch.zeros(args.batch_size, dtype=torch.int32)
     total_tokens = int(seq_lens_cpu.sum())
-    # fp8/bf16 payloads are initialized through integer storage so that the
-    # source contents and the correctness comparison stay bit-exact.
+    # The operator is a pure byte mover, so both caches use int8 byte
+    # containers: aclnnGatherPaKvCache rejects mixed key/value dtypes in Norm
+    # mode (the fp8+bf16 combination is only allowed with PA_NZ).
     key_cache_cpu = torch.randint(-128, 128, (source_blocks, args.block_size, args.num_heads, args.head_size_k),
                                   dtype=torch.int8, generator=generator)
-    value_cache_cpu = torch.randint(-32768, 32768, (source_blocks, args.block_size, args.num_heads, args.head_size_v),
-                                    dtype=torch.int16, generator=generator)
+    value_cache_cpu = torch.randint(-128, 128, (source_blocks, args.block_size, args.num_heads, args.head_size_v),
+                                    dtype=torch.int8, generator=generator)
 
-    key_cache = allocate_source(key_cache_cpu, device, args.source_memory).view(torch.float8_e4m3fn)
-    value_cache = allocate_source(value_cache_cpu, device, args.source_memory).view(torch.bfloat16)
+    key_cache = allocate_source(key_cache_cpu, device, args.source_memory)
+    value_cache = allocate_source(value_cache_cpu, device, args.source_memory)
     return Case(
         device=device, device_name=device_name, source_blocks=source_blocks, block_size=args.block_size,
         bytes_per_token=payload_size, source_memory=args.source_memory,
@@ -94,8 +95,8 @@ def make_case(args: argparse.Namespace) -> Case:
         key_cache=key_cache, value_cache=value_cache,
         block_tables=block_tables_cpu.to(device), seq_lens=seq_lens_cpu.to(device),
         seq_offset=seq_offset_cpu.to(device),
-        key_out=torch.empty((total_tokens, args.num_heads, args.head_size_k), dtype=torch.float8_e4m3fn, device=device),
-        value_out=torch.empty((total_tokens, args.num_heads, args.head_size_v), dtype=torch.bfloat16, device=device),
+        key_out=torch.empty((total_tokens, args.num_heads, args.head_size_k), dtype=torch.int8, device=device),
+        value_out=torch.empty((total_tokens, args.num_heads, args.head_size_v), dtype=torch.int8, device=device),
     )
 
 
@@ -116,7 +117,7 @@ def reference_gather(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
     value_shape = (0, case.value_cache_cpu.shape[2], case.value_cache_cpu.shape[3])
     return (
         torch.cat(keys) if keys else torch.empty(key_shape, dtype=torch.int8),
-        torch.cat(values) if values else torch.empty(value_shape, dtype=torch.int16),
+        torch.cat(values) if values else torch.empty(value_shape, dtype=torch.int8),
     )
 
 
@@ -133,21 +134,20 @@ def call_gather(case: Case, seq_lens: torch.Tensor | None = None,
 
 def assert_gathered(case: Case) -> None:
     expected_key, expected_value = reference_gather(case)
-    # Compare every gathered byte bitwise through integer views, so fp8/bf16
-    # payload bits (including NaN encodings) must match exactly.
-    if not torch.equal(case.key_out.view(torch.int8).cpu(), expected_key):
+    # Byte-exact comparison; the operator must not transform any payload bits.
+    if not torch.equal(case.key_out.cpu(), expected_key):
         raise AssertionError("Gathered key bytes differ from the CPU reference.")
-    if not torch.equal(case.value_out.view(torch.int16).cpu(), expected_value):
+    if not torch.equal(case.value_out.cpu(), expected_value):
         raise AssertionError("Gathered value bytes differ from the CPU reference.")
 
 
 def check_gather(case: Case, phase: str) -> None:
-    case.key_out.view(torch.int8).fill_(POISON)
-    case.value_out.view(torch.int16).fill_(POISON)
+    case.key_out.fill_(POISON)
+    case.value_out.fill_(POISON)
     torch.npu.synchronize()
-    if case.key_out.numel() and not bool((case.key_out.view(torch.int8) == POISON).all().item()):
+    if case.key_out.numel() and not bool((case.key_out == POISON).all().item()):
         raise AssertionError("Key output was not poisoned before the gather.")
-    if case.value_out.numel() and not bool((case.value_out.view(torch.int16) == POISON).all().item()):
+    if case.value_out.numel() and not bool((case.value_out == POISON).all().item()):
         raise AssertionError("Value output was not poisoned before the gather.")
     tensors = (case.key_cache, case.value_cache, case.block_tables, case.seq_lens,
                case.seq_offset, case.key_out, case.value_out)
@@ -170,9 +170,9 @@ def check_gather(case: Case, phase: str) -> None:
         # empty_with_swapped_memory storage is unverified, and the bitwise
         # output comparison above already proves the source bytes were read
         # intact. HBM sources are cheap to verify directly.
-        if not torch.equal(case.key_cache.view(torch.int8).cpu(), case.key_cache_cpu):
+        if not torch.equal(case.key_cache.cpu(), case.key_cache_cpu):
             raise AssertionError("The source key cache was modified.")
-        if not torch.equal(case.value_cache.view(torch.int16).cpu(), case.value_cache_cpu):
+        if not torch.equal(case.value_cache.cpu(), case.value_cache_cpu):
             raise AssertionError("The source value cache was modified.")
     print(
         f"A5_GATHER_PA_KV_CACHE_CHECK phase={phase} "
@@ -223,8 +223,8 @@ def run(args: argparse.Namespace) -> dict:
         flush=True,
     )
     check_gather(case, "requested_workload")
-    zero_key = torch.empty((0, args.num_heads, args.head_size_k), dtype=torch.float8_e4m3fn, device=case.device)
-    zero_value = torch.empty((0, args.num_heads, args.head_size_v), dtype=torch.bfloat16, device=case.device)
+    zero_key = torch.empty((0, args.num_heads, args.head_size_k), dtype=torch.int8, device=case.device)
+    zero_value = torch.empty((0, args.num_heads, args.head_size_v), dtype=torch.int8, device=case.device)
     zero_result = call_gather(case, torch.zeros_like(case.seq_lens), zero_key, zero_value)
     torch.npu.synchronize()
     if zero_key.numel() or zero_value.numel():

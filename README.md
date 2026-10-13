@@ -23,12 +23,14 @@ torch_npu.npu_gather_pa_kv_cache(
 
 所有 tensor 位于同一 NPU、连续存储。输出为紧凑布局，`total_tokens = sum(seq_lens)`；本测试中每个请求的 `seq_lens` 相同（等于 `copy_count`），故 `total_tokens = batch_size × copy_count`。
 
-默认布局对齐 C8 packed MLA 行：`block_size=128`、`num_heads=1`、`head_size_k=512`（fp8_e4m3fn，512B latent）、`head_size_v=72`（bf16，128B RoPE + 16B scale 打包成 8 个 bf16），合计 **656 字节/token**，与 C8 scatter_copy 的 `ROW_BYTES=656` 口径完全一致。布局可用 `--num-heads --head-size-k --head-size-v` 覆盖；bytes/token 始终由配置计算，不硬编码。fp8/bf16 源张量经 int8/int16 存储初始化后 `.view()` 得到，正确性比较按位进行（避免 NaN != NaN 问题）。
+默认布局对齐 C8 packed MLA 行：`block_size=128`、`num_heads=1`、`head_size_k=512` + `head_size_v=144`（**均为 int8 字节容器**，对应 512B latent + 128B RoPE + 16B scale），合计 **656 字节/token**，与 C8 scatter_copy 的 `ROW_BYTES=656` 口径完全一致。布局可用 `--num-heads --head-size-k --head-size-v` 覆盖；bytes/token 始终由配置计算，不硬编码。
+
+> 为什么不用 fp8+bf16 的真实 dtype：`aclnnGatherPaKvCache` 在 Norm 模式下要求 key/value dtype 相同（混合 dtype 仅 PA_NZ 模式放行，实测报 `EZ1001`）。该算子是纯字节搬运、不做数值转换，dtype 只影响寻址宽度，因此 int8 容器测出的带宽与真实 fp8/bf16 布局等价。
 
 ## 环境要求
 
 - Ascend 950（默认校验设备名，调试可用 `--allow-non-a5` 跳过）。
-- CANN 工具包（`ASCEND_HOME_PATH`，默认 `/usr/local/Ascend/ascend-toolkit/latest`）与匹配的 PyTorch/torch_npu；torch_npu 需支持 `float8_e4m3fn` 与 `empty_with_swapped_memory`。
+- CANN 工具包（`ASCEND_HOME_PATH`，默认 `/usr/local/Ascend/ascend-toolkit/latest`）与匹配的 PyTorch/torch_npu；torch_npu 需支持 `empty_with_swapped_memory`（仅 `--source-memory dram` 需要）。
 - 无自定义算子编译步骤；无需设置 `PYTHONPATH` 指向任何 torch_extension。
 
 ## 统一带宽测试
@@ -127,7 +129,7 @@ avg_us_max   = max(t_i)
 avg_bandwidth = sum(D_i / (t_i * 1000))   # GB/s，先逐 die 计算再求和
 ```
 
-`avg_bandwidth` 虽含 avg，含义是基于各 die 平均耗时计算的**带宽之和**，不再除以 cards。只计算一次有效 payload，不把源读取与目标写入重复计数，不使用整块分配容量。默认 `D_i = gathered_tokens_i × 656`（512B FP8 latent + 128B RoPE + 16B scale，与 C8 scatter_copy 口径一致）；覆盖 head size 时按实际配置计算。零 copy 的带宽为 0。
+`avg_bandwidth` 虽含 avg，含义是基于各 die 平均耗时计算的**带宽之和**，不再除以 cards。只计算一次有效 payload，不把源读取与目标写入重复计数，不使用整块分配容量。默认 `D_i = gathered_tokens_i × 656`（512B latent + 128B RoPE + 16B scale，与 C8 scatter_copy 口径一致，int8 字节容器承载）；覆盖 head size 时按实际配置计算。零 copy 的带宽为 0。
 
 `avg_us_max` 是各 die 平均耗时的最大值，不是某次调用的最大耗时。固定 metadata 会重复 gather；初始化、正确性校验及 warmup 不在计时区间。该带宽是此并发测试的有效吞吐估计，结果不代表总线硬件计数器读数。
 
@@ -164,7 +166,7 @@ python3 tests/test_gather_tools.py -v
 ## 注意事项
 
 - 源 KV cache 默认用 `torch_npu.empty_with_swapped_memory` 分配（真实主机 DRAM）。若算子拒绝 swapped-memory 源，加 `--source-memory hbm`（或 `SOURCE_MEMORY=hbm`）降级为普通 HBM 源做测量，并在结果解读时注明。
-- fp8 布局需要支持 `float8_e4m3fn` 的 torch_npu；fp8 张量经 int8 存储初始化后 `.view(torch.float8_e4m3fn)` 得到，比较时按 int8/int16 按位比。
+- 默认布局用 int8 字节容器承载 C8 行（Norm 模式要求 key/value 同 dtype）；如需验证真实 fp8 语义，可改用 PA_NZ 模式（`cache_mode`），但那需要 NZ 格式张量，本仓暂未支持。
 - `seq_lens` 按 vLLM-ascend 用法是 **per-request 长度**（非 cumsum）；`seq_offset` 固定全零。
 - 可选 NUMA 绑定：`GATHER_PA_NUMA_NODES="0,1,..."`（每设备一个 node id，需 `numactl` 在 PATH 上）；默认不绑定。
 - 若 `copy_count=0` 时空输出导致算子报错，worker 会如实失败；请以实际硬件表现为准。

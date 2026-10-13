@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def fixture(latencies=(10.0, 30.0), batch=3, copies=7):
-    config = dict(dtype_k=DTYPE_K, dtype_v=DTYPE_V, num_heads=1, head_size_k=512, head_size_v=72,
+    config = dict(dtype_k=DTYPE_K, dtype_v=DTYPE_V, num_heads=1, head_size_k=512, head_size_v=144,
                   block_size=128, bytes_per_token=BYTES_PER_TOKEN, batch_size=batch,
                   source_len=65536, source_blocks=512, copy_min=copies, copy_max=copies,
                   warmup=0, iters=5, seed=7, source_memory="dram")
@@ -218,7 +218,7 @@ class SweepTests(unittest.TestCase):
         with patch.object(sys, "argv", ["test", "--cards", "2", "--batch-size", "17", "--copy-count", "321"]):
             args = launcher.parse_args()
         self.assertEqual(args.output.name, "cards2_bs17_copy321.json")
-        self.assertEqual((args.num_heads, args.head_size_k, args.head_size_v), (1, 512, 72))
+        self.assertEqual((args.num_heads, args.head_size_k, args.head_size_v), (1, 512, 144))
         self.assertEqual(args.block_size, 128)
         worker = importlib.import_module("test_gather_pa_kv_cache")
         with patch.object(sys, "argv", ["test", "--copy-count", "200"]):
