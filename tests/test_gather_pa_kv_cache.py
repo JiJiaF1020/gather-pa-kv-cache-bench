@@ -30,6 +30,7 @@ class Case:
     key_cache_cpu: torch.Tensor
     value_cache_cpu: torch.Tensor
     block_tables_cpu: torch.Tensor
+    seq_lens_req_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
     seq_offset_cpu: torch.Tensor
     key_cache: torch.Tensor
@@ -71,12 +72,20 @@ def make_case(args: argparse.Namespace) -> Case:
         torch.randperm(source_blocks, generator=generator).to(torch.int32)
         for _ in range(args.batch_size)
     ])
-    seq_lens_cpu = torch.randint(args.copy_min, args.copy_max + 1, (args.batch_size,), dtype=torch.int32, generator=generator)
+    seq_lens_req_cpu = torch.randint(args.copy_min, args.copy_max + 1, (args.batch_size,), dtype=torch.int32, generator=generator)
     if args.batch_size > 1:
-        seq_lens_cpu[0] = args.copy_min
-        seq_lens_cpu[1] = args.copy_max
+        seq_lens_req_cpu[0] = args.copy_min
+        seq_lens_req_cpu[1] = args.copy_max
+    # Device-side seq_lens: per-request lengths (vLLM-ascend style) by default;
+    # --seq-lens-cumsum sends the cumulative form with a leading zero instead,
+    # for wrappers that hardcode is_seq_lens_cumsum=true.
+    if args.seq_lens_cumsum:
+        seq_lens_cpu = torch.zeros(args.batch_size + 1, dtype=torch.int32)
+        torch.cumsum(seq_lens_req_cpu, dim=0, out=seq_lens_cpu[1:])
+    else:
+        seq_lens_cpu = seq_lens_req_cpu
     seq_offset_cpu = torch.zeros(args.batch_size, dtype=torch.int32)
-    total_tokens = int(seq_lens_cpu.sum())
+    total_tokens = int(seq_lens_req_cpu.sum())
     # The operator is a pure byte mover, so both caches use int8 byte
     # containers: aclnnGatherPaKvCache rejects mixed key/value dtypes in Norm
     # mode (the fp8+bf16 combination is only allowed with PA_NZ).
@@ -91,7 +100,8 @@ def make_case(args: argparse.Namespace) -> Case:
         device=device, device_name=device_name, source_blocks=source_blocks, block_size=args.block_size,
         bytes_per_token=payload_size, source_memory=args.source_memory,
         key_cache_cpu=key_cache_cpu, value_cache_cpu=value_cache_cpu,
-        block_tables_cpu=block_tables_cpu, seq_lens_cpu=seq_lens_cpu, seq_offset_cpu=seq_offset_cpu,
+        block_tables_cpu=block_tables_cpu, seq_lens_req_cpu=seq_lens_req_cpu, seq_lens_cpu=seq_lens_cpu,
+        seq_offset_cpu=seq_offset_cpu,
         key_cache=key_cache, value_cache=value_cache,
         block_tables=block_tables_cpu.to(device), seq_lens=seq_lens_cpu.to(device),
         seq_offset=seq_offset_cpu.to(device),
@@ -105,7 +115,7 @@ def reference_gather(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
     key_rows = case.key_cache_cpu.reshape(-1, case.key_cache_cpu.shape[2], case.key_cache_cpu.shape[3])
     value_rows = case.value_cache_cpu.reshape(-1, case.value_cache_cpu.shape[2], case.value_cache_cpu.shape[3])
     keys, values = [], []
-    for row, length in enumerate(case.seq_lens_cpu.tolist()):
+    for row, length in enumerate(case.seq_lens_req_cpu.tolist()):
         if length == 0:
             continue
         tokens = torch.arange(length)
@@ -132,12 +142,30 @@ def call_gather(case: Case, seq_lens: torch.Tensor | None = None,
     )
 
 
+def report_mismatch(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Print a compact corruption pattern before the caller raises."""
+    flat_actual = actual.cpu().reshape(actual.shape[0], -1)
+    flat_expected = expected.reshape(expected.shape[0], -1)
+    bad_rows = (flat_actual != flat_expected).any(dim=1).nonzero().flatten()
+    poison_rows = int((flat_actual == POISON).all(dim=1).sum())
+    print(f"A5_GATHER_PA_MISMATCH tensor={name} total_rows={flat_actual.shape[0]} "
+          f"bad_rows={bad_rows.numel()} unwritten_poison_rows={poison_rows}",
+          flush=True)
+    if bad_rows.numel():
+        first = int(bad_rows[0])
+        print(f"A5_GATHER_PA_MISMATCH_FIRST row={first} "
+              f"expected={flat_expected[first, :16].tolist()} actual={flat_actual[first, :16].tolist()}",
+              flush=True)
+
+
 def assert_gathered(case: Case) -> None:
     expected_key, expected_value = reference_gather(case)
     # Byte-exact comparison; the operator must not transform any payload bits.
     if not torch.equal(case.key_out.cpu(), expected_key):
+        report_mismatch("key", case.key_out, expected_key)
         raise AssertionError("Gathered key bytes differ from the CPU reference.")
     if not torch.equal(case.value_out.cpu(), expected_value):
+        report_mismatch("value", case.value_out, expected_value)
         raise AssertionError("Gathered value bytes differ from the CPU reference.")
 
 
@@ -176,7 +204,7 @@ def check_gather(case: Case, phase: str) -> None:
             raise AssertionError("The source value cache was modified.")
     print(
         f"A5_GATHER_PA_KV_CACHE_CHECK phase={phase} "
-        f"gathered_tokens={int(case.seq_lens_cpu.sum())} bytes_per_token={case.bytes_per_token} "
+        f"gathered_tokens={int(case.seq_lens_req_cpu.sum())} bytes_per_token={case.bytes_per_token} "
         f"byte_exact=1 inputs_readonly=1 caller_owned=1 return_type={return_type} ok=1",
         flush=True,
     )
@@ -208,7 +236,7 @@ def run(args: argparse.Namespace) -> dict:
     torch.npu.empty_cache()
 
     case = make_case(args)
-    gathered_tokens = int(case.seq_lens_cpu.sum())
+    gathered_tokens = int(case.seq_lens_req_cpu.sum())
     payload_bytes = gathered_tokens * case.bytes_per_token
     allocator = "empty_with_swapped_memory" if args.source_memory == "dram" else "torch.empty"
     print(
@@ -217,7 +245,8 @@ def run(args: argparse.Namespace) -> dict:
         f"head_size_k={args.head_size_k} head_size_v={args.head_size_v} "
         f"block_size={args.block_size} bytes_per_token={case.bytes_per_token} "
         f"batch={args.batch_size} source_len={args.source_len} source_blocks={case.source_blocks} "
-        f"copy_range=[{args.copy_min},{args.copy_max}] seq_lens={case.seq_lens_cpu.tolist()} "
+        f"copy_range=[{args.copy_min},{args.copy_max}] seq_lens={case.seq_lens_req_cpu.tolist()} "
+        f"seq_lens_cumsum={int(args.seq_lens_cumsum)} "
         f"source_memory={args.source_memory} allocator={allocator} "
         f"launch_blocking={os.getenv('ASCEND_LAUNCH_BLOCKING', 'unset')}",
         flush=True,
@@ -259,10 +288,10 @@ def run(args: argparse.Namespace) -> dict:
             "batch_size": args.batch_size, "source_len": args.source_len, "source_blocks": case.source_blocks,
             "copy_min": args.copy_min, "copy_max": args.copy_max,
             "warmup": args.warmup, "iters": args.iters, "seed": args.seed,
-            "source_memory": args.source_memory,
+            "source_memory": args.source_memory, "seq_lens_cumsum": bool(args.seq_lens_cumsum),
         },
         "workload": {
-            "seq_lens": case.seq_lens_cpu.tolist(), "gathered_tokens": gathered_tokens,
+            "seq_lens": case.seq_lens_req_cpu.tolist(), "gathered_tokens": gathered_tokens,
             "payload_bytes_per_iteration": payload_bytes,
         },
         "correctness": {

@@ -170,3 +170,4 @@ python3 tests/test_gather_tools.py -v
 - `seq_lens` 按 vLLM-ascend 用法是 **per-request 长度**（非 cumsum）；`seq_offset` 固定全零。
 - 可选 NUMA 绑定：`GATHER_PA_NUMA_NODES="0,1,..."`（每设备一个 node id，需 `numactl` 在 PATH 上）；默认不绑定。
 - 若 `copy_count=0` 时空输出导致算子报错，worker 会如实失败；请以实际硬件表现为准。
+- `seq_lens` 默认按 vLLM-ascend 与官方示例的 per-request 长度语义；若你的 torch_npu 版本封装行为不同导致正确性校验失败（诊断行 `A5_GATHER_PA_MISMATCH` 会打印 bad/unwritten 行数与首个不一致行的期望/实际字节），可加 `--seq-lens-cumsum`（或 `SEQ_LENS_CUMSUM=1`）改传带前导零的累加和形式再试。校验失败时的诊断规则：unwritten 行数 = 总输出且 bad 全覆盖 → 算子没有写（seq_lens 解释不符）；仅部分行错 → 截断或地址计算问题。

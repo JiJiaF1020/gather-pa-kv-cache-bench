@@ -107,6 +107,8 @@ def run_workers(args: argparse.Namespace, devices: list[int]) -> list[dict]:
                 ]
                 if args.allow_non_a5:
                     command.append("--allow-non-a5")
+                if args.seq_lens_cumsum:
+                    command.append("--seq-lens-cumsum")
                 if numa_nodes:
                     node = numa_nodes[rank]
                     command = ["numactl", f"--cpunodebind={node}", f"--membind={node}"] + command
@@ -159,7 +161,8 @@ def summarize(args: argparse.Namespace, devices: list[int], per_device: list[dic
             "batch_size": args.batch_size, "source_len": args.source_len,
             "copy_min": args.copy_min, "copy_max": args.copy_max,
             "warmup": args.warmup, "iters": args.iters, "seed": args.seed,
-            "source_memory": args.source_memory, "allow_non_a5": args.allow_non_a5,
+            "source_memory": args.source_memory, "seq_lens_cumsum": bool(args.seq_lens_cumsum),
+            "allow_non_a5": args.allow_non_a5,
         },
         "summary": {
             **summarize_devices(per_device),

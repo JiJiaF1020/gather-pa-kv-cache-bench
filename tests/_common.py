@@ -37,6 +37,8 @@ def add_case_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-memory", choices=("dram", "hbm"), default="dram",
                         help="dram: source caches via torch_npu.empty_with_swapped_memory; "
                              "hbm: plain device tensors (fallback if the operator rejects swapped-memory sources).")
+    parser.add_argument("--seq-lens-cumsum", action="store_true",
+                        help="Send seq_lens as cumulative sums with a leading zero instead of per-request lengths.")
     parser.add_argument("--allow-non-a5", action="store_true", help="Portability debugging only; not A5 validation.")
 
 
