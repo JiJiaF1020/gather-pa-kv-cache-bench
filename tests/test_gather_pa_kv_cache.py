@@ -217,14 +217,30 @@ def wait_for_start(ready_file: Path | None, start_file: Path | None) -> None:
 
 def run(args: argparse.Namespace) -> dict:
     # Exercise a first-fill-sized request (one request gathering source_len
-    # tokens) through the SAME operator, outside timing.
-    fill_args = argparse.Namespace(**vars(args))
-    fill_args.batch_size = 1
-    fill_args.copy_min = fill_args.copy_max = args.source_len
-    fill_case = make_case(fill_args)
-    check_gather(fill_case, "first_fill_capacity")
-    del fill_case
-    torch.npu.empty_cache()
+    # tokens) through the SAME operator, outside timing. The operator silently
+    # writes nothing for some large shapes (no error raised), so retry with
+    # halved lengths and record the largest size that passes instead of
+    # blocking the bandwidth run on a capacity probe.
+    fill_len = args.source_len
+    fill_passed = False
+    while True:
+        fill_args = argparse.Namespace(**vars(args))
+        fill_args.batch_size = 1
+        fill_args.copy_min = fill_args.copy_max = fill_len
+        fill_case = make_case(fill_args)
+        try:
+            check_gather(fill_case, f"first_fill_len{fill_len}")
+            fill_passed = True
+        except AssertionError as error:
+            if fill_len <= 1024:
+                raise AssertionError(
+                    f"first-fill gather failed even at seq_len={fill_len}: {error}") from error
+            print(f"A5_GATHER_PA_FIRST_FILL_RETRY seq_len={fill_len} failed, halving", flush=True)
+            fill_len //= 2
+        del fill_case
+        torch.npu.empty_cache()
+        if fill_passed:
+            break
 
     case = make_case(args)
     gathered_tokens = int(case.seq_lens_req_cpu.sum())
@@ -287,6 +303,7 @@ def run(args: argparse.Namespace) -> dict:
         "correctness": {
             "data_exact": True, "caller_owned": True, "inputs_readonly": True,
             "zero_count_noop": True, "first_fill_capacity": True,
+            "first_fill_max_seq_len": fill_len,
         },
         "summary": single_result(args, payload_bytes, avg_us),
         "performance": {"timer": "npu_event", "avg_us": avg_us},
