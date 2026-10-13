@@ -104,7 +104,7 @@ def run_scale(name: str, num_blocks: int, block: int, seq: int,
         generator = torch.Generator().manual_seed(7)
         key_cpu = torch.randint(-128, 128, (num_blocks, block, 1, row_k), dtype=torch.int8, generator=generator)
         value_cpu = torch.randint(-128, 128, (num_blocks, block, 1, row_v), dtype=torch.int8, generator=generator)
-        perm_cpu = torch.randperm(num_blocks, generator=generator).to(torch.int32)
+        perm_cpu = torch.randperm(num_blocks, generator=generator).to(torch.int32).unsqueeze(0)  # [1, num_blocks]
         seq_lens = torch.tensor([seq], dtype=torch.int32)
         key = torch.full((seq, 1, row_k), 65, dtype=torch.int8, device=device)
         value = torch.full((seq, 1, row_v), 65, dtype=torch.int8, device=device)
@@ -114,7 +114,7 @@ def run_scale(name: str, num_blocks: int, block: int, seq: int,
         torch.npu.synchronize()
         # CPU reference: token t lives at physical row perm[t // block] * block + t % block
         tokens = torch.arange(seq)
-        physical = perm_cpu.long()[tokens // block] * block + tokens % block
+        physical = perm_cpu[0].long()[tokens // block] * block + tokens % block
         want_key = key_cpu.reshape(-1, 1, row_k)[physical]
         want_value = value_cpu.reshape(-1, 1, row_v)[physical]
         got = key.cpu()
