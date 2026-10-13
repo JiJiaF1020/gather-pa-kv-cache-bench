@@ -58,7 +58,7 @@ def run_variant(name: str, seq_lens: torch.Tensor, seq_offset) -> None:
         if status == "WRITTEN-BUT-WRONG":
             print(f"  expected row0={want[0, 0].tolist()} got row0={got[0, 0].tolist()}")
     except Exception as error:  # noqa: BLE001 - probe reports everything
-        message = str(error).replace("\n", " ")[:300]
+        message = str(error).replace("\n", " ")[:2000]
         print(f"[{name}] FAILED: {message}")
 
 
@@ -84,11 +84,13 @@ def main() -> None:
                 torch.zeros(BATCH, dtype=torch.int64))
 
     # Scale bisect: the bench worker's first-fill case (batch=1, seq=source_len,
-    # block=1, rows 512B/144B, randperm block table, no seq_offset) fails with
-    # NOTHING-WRITTEN while the tiny probe above passes. Sweep one knob at a
-    # time to find the trigger.
+    # block=1, rows 512B/144B, randperm block table, no seq_offset) fails while
+    # the tiny probe above passes. Sweep one knob at a time to find the trigger.
     print("=" * 60)
-    print("scale bisect (per-request int32, no seq_offset):")
+    print("row-size bisect (block=1, seq=4, num_blocks=4):")
+    for row_k, row_v in ((8, 8), (512, 512), (144, 144), (512, 144), (576, 512), (64, 64), (128, 128), (256, 256)):
+        run_scale(f"row{row_k}x{row_v}", num_blocks=4, block=1, seq=4, row_k=row_k, row_v=row_v)
+    print("seq bisect (block=1, rows 512x144):")
     for seq in (4, 64, 256, 1024, 4096, 16384, 65536):
         run_scale(f"blk1_seq{seq}", num_blocks=seq, block=1, seq=seq)
     run_scale("blk1_seq4_wide_table", num_blocks=65536, block=1, seq=4)
@@ -129,7 +131,7 @@ def run_scale(name: str, num_blocks: int, block: int, seq: int,
         del key, value, key_cpu, value_cpu
         torch.npu.empty_cache()
     except Exception as error:  # noqa: BLE001 - probe reports everything
-        message = str(error).replace("\n", " ")[:300]
+        message = str(error).replace("\n", " ")[:2000]
         print(f"[{name}] FAILED: {message}")
 
 
