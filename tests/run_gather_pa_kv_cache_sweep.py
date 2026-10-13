@@ -56,8 +56,6 @@ def parse_args(argv=None):
     parser.add_argument("--block-size", type=int, default=int(os.getenv("BLOCK_SIZE", str(BLOCK_SIZE))),
                         help="Cache block size in tokens; 1 gives token-granular random gather.")
     parser.add_argument("--source-memory", choices=("dram", "hbm"), default=os.getenv("SOURCE_MEMORY", "dram"))
-    parser.add_argument("--seq-lens-cumsum", action="store_true", default=os.getenv("SEQ_LENS_CUMSUM") == "1",
-                        help="Send seq_lens as cumulative sums with a leading zero.")
     parser.add_argument("--results-dir", type=Path, default=Path(os.getenv("RESULTS_DIR", str(ROOT / RESULTS_SUBDIR))))
     parser.add_argument("--dry-run", action="store_true", default=os.getenv("DRY_RUN") == "1",
                         help="Validate and print commands without importing Torch, loading CANN or starting NPUs.")
@@ -99,8 +97,6 @@ def cases(args):
                            "--source-memory", args.source_memory,
                            "--warmup", str(args.warmup), "--iters", str(args.iters), "--seed", str(args.seed),
                            "--same-seed", "--output", str(output)]
-                if args.seq_lens_cumsum:
-                    command.append("--seq-lens-cumsum")
                 yield name, output, command
 
 

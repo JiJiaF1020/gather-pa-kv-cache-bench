@@ -32,7 +32,8 @@ def make_inputs(seq_lens: torch.Tensor, seq_offset):
     block_tables = torch.ones((BATCH, 1), dtype=torch.int32, device=device)  # physical block 1
     key = torch.full((SEQ, 1, ROW), 65, dtype=torch.int8, device=device)
     value = torch.full((SEQ, 1, ROW), 65, dtype=torch.int8, device=device)
-    return key_cache, value_cache, block_tables, seq_lens.to(device), seq_offset, key, value
+    return key_cache, value_cache, block_tables, seq_lens.to(device), (
+        seq_offset.to(device) if seq_offset is not None else None), key, value
 
 
 def expected():

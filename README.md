@@ -15,7 +15,7 @@ torch_npu.npu_gather_pa_kv_cache(
     value_cache,    # [num_blocks, 128, num_heads, head_size_v]，只读
     block_tables,   # int32[batch, source_blocks]，请求逻辑块 -> 源物理块
     seq_lens,       # int32[batch]，每个请求的固定 token 数（per-request 长度，非 cumsum）
-    seq_offset=seq_offset,  # int32[batch]，本测试固定全零
+    # 不传 seq_offset：实测该 torch_npu 版本封装传了（即使全零）会导致算子一个字不写
     key=key_out,    # caller 分配的输出 [total_tokens, num_heads, head_size_k]
     value=value_out,        # [total_tokens, num_heads, head_size_v]
 )
@@ -111,7 +111,7 @@ A5_TEST_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CARD_COUNTS="1 2 4 8" BATCH_SIZES="8 16 
   bash tests/run_gather_pa_kv_cache_multiprocess.sh
 ```
 
-每组校验内容：CPU 参考 gather（经 `block_tables` 逐 token 映射到源物理行）与设备输出**按位比较**；每次校验前对输出写 poison；first-fill 容量校验（单请求 `seq_len=source_len`）；`copy_count=0` 时 `seq_lens` 全零、输出为空张量，调用必须是 no-op；输入只读校验（`block_tables`/`seq_lens`/`seq_offset` 调用前后逐字节不变；`--source-memory hbm` 时源 cache 也直接回读校验，DRAM/swapped-memory 源不做 D2H 回读，其字节完好性由输出的按位比较间接证明）；caller-owned 校验（调用前后 `data_ptr` 不变；该 torch_npu 封装可能无返回值，只打印实际返回类型，不断言）。
+每组校验内容：CPU 参考 gather（经 `block_tables` 逐 token 映射到源物理行）与设备输出**按位比较**；每次校验前对输出写 poison；first-fill 容量校验（单请求 `seq_len=source_len`）；`copy_count=0` 时 `seq_lens` 全零、输出为空张量，调用必须是 no-op；输入只读校验（`block_tables`/`seq_lens` 调用前后逐字节不变；`--source-memory hbm` 时源 cache 也直接回读校验，DRAM/swapped-memory 源不做 D2H 回读，其字节完好性由输出的按位比较间接证明）；caller-owned 校验（调用前后 `data_ptr` 不变；该 torch_npu 封装可能无返回值，只打印实际返回类型，不断言）。
 
 ## 六列结果与带宽口径
 
@@ -167,7 +167,7 @@ python3 tests/test_gather_tools.py -v
 
 - 源 KV cache 默认用 `torch_npu.empty_with_swapped_memory` 分配（真实主机 DRAM）。若算子拒绝 swapped-memory 源，加 `--source-memory hbm`（或 `SOURCE_MEMORY=hbm`）降级为普通 HBM 源做测量，并在结果解读时注明。
 - 默认布局用 int8 字节容器承载 C8 行（Norm 模式要求 key/value 同 dtype）；如需验证真实 fp8 语义，可改用 PA_NZ 模式（`cache_mode`），但那需要 NZ 格式张量，本仓暂未支持。
-- `seq_lens` 按 vLLM-ascend 用法是 **per-request 长度**（非 cumsum）；`seq_offset` 固定全零。
+- `seq_lens` 按 vLLM-ascend 用法是 **per-request 长度**（非 cumsum）；**不传 `seq_offset`**（实测本仓所用 torch_npu 版本：传了该参数，即使全零、int32、在 device 上，算子也会一个字不写——校验表现为全部输出行仍是 poison）。可用 `python3 tests/probe_gather_pa_kv_cache.py` 在你的环境上复现/复核该行为，它会枚举 per-request/cumsum、int32/int64、传/不传 seq_offset 各变体并报告哪个写对了数据。
+- 若正确性校验失败，诊断行 `A5_GATHER_PA_MISMATCH` 会打印 bad/unwritten 行数与首个不一致行的期望/实际字节。判读规则：unwritten 行数 = 总输出且 bad 全覆盖 → 算子没有写（参数语义不符）；仅部分行错 → 截断或地址计算问题。
 - 可选 NUMA 绑定：`GATHER_PA_NUMA_NODES="0,1,..."`（每设备一个 node id，需 `numactl` 在 PATH 上）；默认不绑定。
 - 若 `copy_count=0` 时空输出导致算子报错，worker 会如实失败；请以实际硬件表现为准。
-- `seq_lens` 默认按 vLLM-ascend 与官方示例的 per-request 长度语义；若你的 torch_npu 版本封装行为不同导致正确性校验失败（诊断行 `A5_GATHER_PA_MISMATCH` 会打印 bad/unwritten 行数与首个不一致行的期望/实际字节），可加 `--seq-lens-cumsum`（或 `SEQ_LENS_CUMSUM=1`）改传带前导零的累加和形式再试。校验失败时的诊断规则：unwritten 行数 = 总输出且 bad 全覆盖 → 算子没有写（seq_lens 解释不符）；仅部分行错 → 截断或地址计算问题。
